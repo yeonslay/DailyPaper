@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Daily Papers · {{ date }}</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <div class="logo">DP</div>
+      <div>
+        <div class="title">Daily Papers</div>
+        <div class="subtitle">{{ date }} (어제 확정본)</div>
+      </div>
+    </div>
+
+    <div class="controls">
+      <select id="dateSel" class="select">
+        {% for d in dates %}
+          <option value="{{ d }}" {% if d==date %}selected{% endif %}>{{ d }}</option>
+        {% endfor %}
+      </select>
+
+      <input id="q" class="search" placeholder="검색: 제목/키워드" />
+
+      <select id="labelSel" class="select">
+        <option value="__all__">전체 라벨</option>
+        {% for lb in labels %}
+          <option value="{{ lb }}">{{ lb }}</option>
+        {% endfor %}
+      </select>
+    </div>
+  </header>
+
+  <main class="wrap">
+    {% for lb in labels %}
+      <section class="section" data-label="{{ lb }}">
+        <div class="sectionHead">
+          <h2>{{ lb }}</h2>
+          <span class="count">{{ buckets[lb] | length }}</span>
+        </div>
+
+        <div class="grid">
+          {% for item in buckets[lb] %}
+            {% set c = item.card %}
+            <article class="card"
+                     data-title="{{ item.title | lower }}"
+                     data-keywords="{{ (c.get('keywords', []) | join(' ')) | lower }}"
+                     data-label="{{ lb }}">
+              <div class="cardTop">
+                <div class="pid">{{ item.pid }}</div>
+                {% if item.url %}
+                  <a class="link" href="{{ item.url }}" target="_blank">원문</a>
+                {% endif %}
+              </div>
+
+              <div class="cardTitle">{{ item.title }}</div>
+
+              {% if c %}
+                <div class="one">{{ c.get('one_liner','') }}</div>
+
+                <div class="chips">
+                  {% for kw in c.get('keywords', [])[:6] %}
+                    <span class="chip">{{ kw }}</span>
+                  {% endfor %}
+                </div>
+
+                <details class="detail">
+                  <summary>요약 펼치기</summary>
+                  <div class="kv"><b>문제</b><div>{{ c.get('problem','') }}</div></div>
+                  <div class="kv"><b>방법</b><div>{{ c.get('method','') }}</div></div>
+                  <div class="kv"><b>새로움</b><div>{{ c.get('what_is_new','') }}</div></div>
+                  <div class="kv"><b>근거</b><div>{{ c.get('evidence','') }}</div></div>
+                  <div class="kv"><b>한계</b><div>{{ c.get('limitations','') }}</div></div>
+                </details>
+              {% else %}
+                <div class="one muted">아직 분석 전</div>
+              {% endif %}
+            </article>
+          {% endfor %}
+        </div>
+      </section>
+    {% endfor %}
+  </main>
+
+  <script>
+    const dateSel = document.getElementById("dateSel");
+    dateSel.addEventListener("change", () => {
+      location.href = "/d/" + dateSel.value;
+    });
+
+    const q = document.getElementById("q");
+    const labelSel = document.getElementById("labelSel");
+
+    function applyFilters() {
+      const query = q.value.trim().toLowerCase();
+      const lb = labelSel.value;
+
+      // 섹션/카드 필터
+      document.querySelectorAll(".section").forEach(sec => {
+        const secLabel = sec.dataset.label;
+        const secMatch = (lb === "__all__" || lb === secLabel);
+        let anyVisible = false;
+
+        sec.querySelectorAll(".card").forEach(card => {
+          const title = card.dataset.title || "";
+          const kws = card.dataset.keywords || "";
+          const textMatch = (!query || title.includes(query) || kws.includes(query));
+          const visible = secMatch && textMatch;
+          card.style.display = visible ? "" : "none";
+          if (visible) anyVisible = true;
+        });
+
+        sec.style.display = anyVisible ? "" : "none";
+      });
+    }
+
+    q.addEventListener("input", applyFilters);
+    labelSel.addEventListener("change", applyFilters);
+  </script>
+</body>
+</html>
