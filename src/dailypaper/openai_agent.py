@@ -72,7 +72,6 @@ url:
 {paper.url}
 """.strip()
 
-    # JSON 파싱 실패나 일시적 오류 대비 재시도
     backoffs = [0, 1, 2, 4]
     last_err = None
 
@@ -87,14 +86,13 @@ url:
                     {"role": "user", "content": user},
                 ],
                 temperature=0,
-                # "JSON만" 나오게 강제 (SDK/서버가 지원하는 경우에만 적용됨)
                 response_format={"type": "json_object"},
             )
 
             text = resp.choices[0].message.content.strip()
             obj = json.loads(text)
 
-            # 최소 검증 (키 누락 방지) — 프롬프트 필드: background, gap
+            # 최소 검증 (키 누락 방지)
             required = [
                 "labels",
                 "label_confidence",
@@ -115,7 +113,6 @@ url:
             if not obj["labels"]:
                 obj["labels"] = ["Other"]
 
-            # 앱 호환: problem / what_is_new (app.py에서 사용)
             obj["problem"] = obj.get("background", "")
             obj["what_is_new"] = obj.get("gap", "")
 

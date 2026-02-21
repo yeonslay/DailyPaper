@@ -77,9 +77,6 @@ def upsert_annotation(date: str, pid: str, labels_json: str, card_json: str):
         con.commit()
 
 def load_grouped_titles(date: str):
-    """
-    show 용: 라벨별로 제목 모으기
-    """
     with _connect() as con:
         cur = con.cursor()
         cur.execute(
@@ -118,10 +115,6 @@ def list_dates(limit: int = 30):
         return [r[0] for r in cur.fetchall()]
 
 def list_cards_by_label(date: str):
-    """
-    웹용: (라벨 -> 카드 리스트)
-    카드 리스트는 {pid,title,url,card_json} 구조
-    """
     import json as _json
     with _connect() as con:
         cur = con.cursor()
@@ -147,7 +140,6 @@ def list_cards_by_label(date: str):
         except Exception:
             labels = ["Unlabeled"]
 
-        # card_json 파싱 (실패해도 title은 보여주기)
         try:
             card = _json.loads(card_json) if card_json else {}
         except Exception:

@@ -6,9 +6,7 @@ import requests
 from .config import SETTINGS, PATHS
 
 def fetch_hf_daily(date_yyyy_mm_dd: str, save_raw: bool = True) -> str:
-    """
-    HF Daily Papers 공개 API에서 raw JSON 텍스트를 가져온다.
-    """
+
     url = SETTINGS.hf_api_base + date_yyyy_mm_dd
 
     # 간단한 재시도(backoff): 429/5xx 대비
@@ -29,12 +27,10 @@ def fetch_hf_daily(date_yyyy_mm_dd: str, save_raw: bool = True) -> str:
                     raw_path.write_text(raw, encoding="utf-8")
                 return raw
 
-            # 429/5xx 는 재시도
             if r.status_code in (429, 500, 502, 503, 504):
                 last_err = RuntimeError(f"HF HTTP {r.status_code}: {r.text[:300]}")
                 continue
 
-            # 그 외는 즉시 실패
             raise RuntimeError(f"HF HTTP {r.status_code}: {r.text[:300]}")
 
         except Exception as e:
