@@ -706,6 +706,10 @@ with st.sidebar:
     q = st.text_input("검색", placeholder="제목/키워드/요약 내용 검색")
     only_done = st.toggle("분석 완료만 보기", value=True)
 
+# rerun 직후 토스트 표시 (st.rerun 전에 st.toast 호출하면 사라지므로, 세션에 저장 후 다음 로드에서 표시)
+if "toast_msg" in st.session_state:
+    msg = st.session_state.pop("toast_msg")
+    st.toast(msg, duration=3)
 
 # -----------------------------
 # Filter
@@ -798,9 +802,6 @@ def render_card(c, render_key: str):
     )
 
     _, heart_col, zotero_col = st.columns([0.90, 0.05, 0.05], vertical_alignment="center")
-    zotero_clicked = False
-    zotero_log_key = f"zlog_{render_key}_{pid}"
-    zotero_status_key = f"zstatus_{render_key}_{pid}"
     with heart_col:
         is_saved = favorite_pdf_path(c, date).exists()
         heart_icon = "❤️" if is_saved else "♡"
@@ -822,30 +823,17 @@ def render_card(c, render_key: str):
     if clicked:
         try:
             save_favorite_pdf(c, date)
+            st.session_state["toast_msg"] = "저장됨"
         except Exception:
             pass
-        st.rerun(scope="fragment")
+        st.rerun()
     if zotero_clicked:
         try:
-            result = add_to_zotero(c, date)
-            st.session_state[zotero_log_key] = result.get("logs", [])
-            st.session_state[zotero_status_key] = "success"
-            st.toast("Added to Zotero")
-            st.rerun(scope="fragment")
+            add_to_zotero(c, date)
+            st.session_state["toast_msg"] = "Zotero에 저장됨"
+            st.rerun()
         except Exception as e:
-            st.session_state[zotero_log_key] = getattr(e, "logs", [])
-            st.session_state[zotero_status_key] = "error"
-            st.toast(f"Zotero failed: {e}", icon="⚠️")
-            st.error(f"Zotero upload failed: {e}")
-            if getattr(e, "logs", None):
-                st.code("\n".join(e.logs), language="text")
-
-    # details (Streamlit expander가 UI 더 좋음)
-    last_logs = st.session_state.get(zotero_log_key, [])
-    if last_logs:
-        last_status = st.session_state.get(zotero_status_key, "")
-        with st.expander("Zotero log", expanded=(last_status == "error")):
-            st.code("\n".join(last_logs), language="text")
+            st.toast(f"Zotero 실패: {e}", icon="⚠️", duration=3)
 
     with st.expander("자세히", expanded=False):
         if not card:
