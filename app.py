@@ -86,6 +86,16 @@ span.badge--nolink { color: var(--muted); cursor: default; }
   margin-top: -40px;
   margin-bottom: 8px;
 }
+/* 자세히 expander를 위 카드에 더 가깝게 */
+[data-testid="stExpander"] {
+  margin-top: -20px !important;
+  margin-bottom: 2px !important;
+}
+[data-testid="stExpander"] summary,
+[data-testid="stExpander"] summary p,
+[data-testid="stExpander"] summary span {
+  color: var(--muted) !important;
+}
 [data-testid="stButton"] > button[kind="tertiary"] {
   width: 36px !important;
   min-width: 36px !important;
