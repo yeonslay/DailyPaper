@@ -33,6 +33,7 @@ ZOTERO_API_KEY = os.environ.get("ZOTERO_API_KEY", "").strip()
 ZOTERO_USER_ID = os.environ.get("ZOTERO_USER_ID", "").strip()
 ZOTERO_COLLECTION = os.environ.get("ZOTERO_COLLECTION", "").strip()
 SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where()) if certifi else ssl.create_default_context()
+APP_LABEL_CONFIDENCE_THRESHOLD = 0.60
 
 class ZoteroSyncError(RuntimeError):
     def __init__(self, message: str, logs: list[str] | None = None):
@@ -303,6 +304,12 @@ def safe_json(s, default):
         return json.loads(s) if isinstance(s, str) and s.strip() else default
     except Exception:
         return default
+
+def _is_confident_score(value, threshold: float) -> bool:
+    try:
+        return float(value) >= float(threshold)
+    except Exception:
+        return False
 
 INVALID_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1F]')
 
@@ -651,6 +658,21 @@ def explode_cards(df: pd.DataFrame):
         if not isinstance(labels, list) or len(labels) == 0:
             labels = ["Unlabeled"]
         card = safe_json(r["card_json"], {})
+        if isinstance(card, dict):
+            conf = card.get("label_confidence", {})
+            if isinstance(conf, dict) and conf:
+                filtered_labels = []
+                for lb in labels:
+                    try:
+                        score = float(conf.get(lb, 0))
+                    except Exception:
+                        score = 0.0
+                    if score >= APP_LABEL_CONFIDENCE_THRESHOLD:
+                        filtered_labels.append(lb)
+                if filtered_labels:
+                    labels = filtered_labels
+                else:
+                    labels = ["Unlabeled"]
         cards.append(
             {
                 "date": r["date"],
@@ -860,6 +882,11 @@ def render_card(c, render_key: str):
 
         # confidence table (있으면)
         conf = card.get("label_confidence", {})
+        if isinstance(conf, dict) and conf:
+            conf = {
+                k: v for k, v in conf.items()
+                if _is_confident_score(v, APP_LABEL_CONFIDENCE_THRESHOLD)
+            }
         if isinstance(conf, dict) and conf:
             st.markdown("**라벨 확신도**")
             conf_df = pd.DataFrame({"label": list(conf.keys()), "score": list(conf.values())})
