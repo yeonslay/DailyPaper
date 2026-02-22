@@ -1,8 +1,11 @@
 import html
 import json
 import os
+import re
+import shutil
 import sqlite3
 from pathlib import Path
+import urllib.request
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -15,6 +18,7 @@ from openai import OpenAI
 # -----------------------------
 ROOT = Path(__file__).resolve().parent
 DB_PATH = ROOT / "data" / "db" / "dailypaper.sqlite3"
+FAVORITES_ROOT = ROOT.parent / "DailyPaperFavorite"
 
 st.set_page_config(
     page_title="Daily Papers",
@@ -76,6 +80,27 @@ span.badge--nolink { color: var(--muted); cursor: default; }
   border-radius: 999px;
   padding: 4px 10px;
   font-size: 0.80rem;
+}
+[data-testid="stButton"] {
+  margin-top: -40px;
+  margin-bottom: 8px;
+}
+[data-testid="stButton"] > button[kind="tertiary"] {
+  width: 36px !important;
+  min-width: 36px !important;
+  height: 36px !important;
+  min-height: 36px !important;
+  border-radius: 999px !important;
+  padding: 0 !important;
+  font-size: 1.2rem !important;
+  line-height: 1 !important;
+  border: 1px solid rgba(255,255,255,.12) !important;
+  background: rgba(17,24,36,.82) !important;
+}
+[data-testid="stButton"] > button[kind="tertiary"]:hover,
+[data-testid="stButton"] > button[kind="tertiary"]:active,
+[data-testid="stButton"] > button[kind="tertiary"]:focus {
+  transform: none !important;
 }
 .hr { height: 1px; background: rgba(255,255,255,.06); margin: 10px 0; }
 .kv b { display:block; color: var(--muted); font-size: 0.82rem; margin-bottom: 6px; }
@@ -234,6 +259,58 @@ def safe_json(s, default):
     except Exception:
         return default
 
+INVALID_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1F]')
+
+def sanitize_filename(name: str, fallback: str = "paper") -> str:
+    cleaned = INVALID_FILENAME_RE.sub("_", (name or "").strip())
+    cleaned = re.sub(r"\s+", " ", cleaned).rstrip(" .")
+    if not cleaned:
+        cleaned = INVALID_FILENAME_RE.sub("_", fallback).strip() or "paper"
+    return cleaned[:180]
+
+def to_pdf_url(pid: str, url: str) -> str:
+    raw = (url or "").strip()
+    if not raw and pid:
+        return f"https://arxiv.org/pdf/{pid}.pdf"
+    if not raw:
+        return ""
+    if not raw.startswith(("http://", "https://")):
+        raw = "https://" + raw
+
+    if "arxiv.org/abs/" in raw:
+        aid = raw.split("arxiv.org/abs/", 1)[1]
+        aid = aid.split("?", 1)[0].split("#", 1)[0].strip("/")
+        return f"https://arxiv.org/pdf/{aid}.pdf"
+
+    if "arxiv.org/pdf/" in raw:
+        base = raw.split("?", 1)[0].split("#", 1)[0]
+        return base if base.endswith(".pdf") else f"{base}.pdf"
+
+    return raw
+
+def favorite_pdf_path(card: dict, fallback_date: str) -> Path:
+    paper_date = str(card.get("date") or fallback_date)
+    pid = str(card.get("pid") or "").strip()
+    title = str(card.get("title") or "").strip()
+    stem = sanitize_filename(title or pid, fallback=(pid or "paper"))
+    return FAVORITES_ROOT / paper_date / f"{stem}.pdf"
+
+def save_favorite_pdf(card: dict, fallback_date: str):
+    target = favorite_pdf_path(card, fallback_date)
+    if target.exists():
+        return
+
+    pid = str(card.get("pid") or "").strip()
+    url = str(card.get("url") or "").strip()
+    pdf_url = to_pdf_url(pid, url)
+    if not pdf_url:
+        return
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    req = urllib.request.Request(pdf_url, headers={"User-Agent": "DailyPaper/1.0"})
+    with urllib.request.urlopen(req, timeout=90) as resp, open(target, "wb") as f:
+        shutil.copyfileobj(resp, f)
+
 def explode_cards(df: pd.DataFrame):
     cards = []
     for _, r in df.iterrows():
@@ -243,6 +320,7 @@ def explode_cards(df: pd.DataFrame):
         card = safe_json(r["card_json"], {})
         cards.append(
             {
+                "date": r["date"],
                 "pid": r["pid"],
                 "title": r["title"] or "",
                 "url": r["url"] or "",
@@ -333,7 +411,8 @@ if label == "(전체)":
 else:
     ordered_labels = [label]
 
-def render_card(c):
+@st.fragment
+def render_card(c, render_key: str):
     card = c["card"]
     pid = c["pid"]
     title = c["title"]
@@ -373,6 +452,24 @@ def render_card(c):
         unsafe_allow_html=True,
     )
 
+    _, heart_col = st.columns([0.95, 0.05], vertical_alignment="center")
+    with heart_col:
+        is_saved = favorite_pdf_path(c, date).exists()
+        heart_icon = "❤️" if is_saved else "♡"
+        clicked = st.button(
+            heart_icon,
+            key=f"fav_{render_key}_{pid}",
+            type="tertiary",
+            width="content",
+            help="Save PDF",
+        )
+    if clicked:
+        try:
+            save_favorite_pdf(c, date)
+        except Exception:
+            pass
+        st.rerun(scope="fragment")
+
     # details (Streamlit expander가 UI 더 좋음)
     with st.expander("자세히", expanded=False):
         if not card:
@@ -402,7 +499,7 @@ def render_card(c):
         if isinstance(conf, dict) and conf:
             st.markdown("**라벨 확신도**")
             conf_df = pd.DataFrame({"label": list(conf.keys()), "score": list(conf.values())})
-            st.dataframe(conf_df.sort_values("score", ascending=False), use_container_width=True, hide_index=True)
+            st.dataframe(conf_df.sort_values("score", ascending=False), width="stretch", hide_index=True)
 
 # -----------------------------
 # Render sections
@@ -414,7 +511,7 @@ for lb in ordered_labels:
 
     st.markdown(f"## {lb}  <span class='small'>({len(section_cards)})</span>", unsafe_allow_html=True)
 
-    for c in section_cards:
-        render_card(c)
+    for idx, c in enumerate(section_cards):
+        render_card(c, f"{lb}_{idx}")
 
 st.markdown("<div class='footerHint'>© minju · Daily Papers dashboard</div>", unsafe_allow_html=True)

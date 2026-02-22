@@ -362,7 +362,7 @@ def render_card(c):
         if isinstance(conf, dict) and conf:
             st.markdown("**라벨 확신도**")
             conf_df = pd.DataFrame({"label": list(conf.keys()), "score": list(conf.values())})
-            st.dataframe(conf_df.sort_values("score", ascending=False), use_container_width=True, hide_index=True)
+            st.dataframe(conf_df.sort_values("score", ascending=False), width="stretch", hide_index=True)
 
 # -----------------------------
 # Render sections

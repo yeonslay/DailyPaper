@@ -31,5 +31,8 @@ build/
 
 # 기타
 *.log
+# 다운로드한 PDF
+data/downloads/
 .DS_Store
 Thumbs.db
+
