@@ -1,16 +1,26 @@
 import html
+import hashlib
 import json
 import os
 import re
 import shutil
 import sqlite3
+import ssl
 from pathlib import Path
+import time
+import urllib.error
+import urllib.parse
 import urllib.request
 
 from dotenv import load_dotenv
 load_dotenv()
+try:
+    import certifi
+except Exception:
+    certifi = None
 
 import pandas as pd
+import requests
 import streamlit as st
 from openai import OpenAI
 # -----------------------------
@@ -19,6 +29,15 @@ from openai import OpenAI
 ROOT = Path(__file__).resolve().parent
 DB_PATH = ROOT / "data" / "db" / "dailypaper.sqlite3"
 FAVORITES_ROOT = ROOT.parent / "DailyPaperFavorite"
+ZOTERO_API_KEY = os.environ.get("ZOTERO_API_KEY", "").strip()
+ZOTERO_USER_ID = os.environ.get("ZOTERO_USER_ID", "").strip()
+ZOTERO_COLLECTION = os.environ.get("ZOTERO_COLLECTION", "").strip()
+SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where()) if certifi else ssl.create_default_context()
+
+class ZoteroSyncError(RuntimeError):
+    def __init__(self, message: str, logs: list[str] | None = None):
+        super().__init__(message)
+        self.logs = logs or []
 
 st.set_page_config(
     page_title="Daily Papers",
@@ -334,8 +353,267 @@ def save_favorite_pdf(card: dict, fallback_date: str):
 
     target.parent.mkdir(parents=True, exist_ok=True)
     req = urllib.request.Request(pdf_url, headers={"User-Agent": "DailyPaper/1.0"})
-    with urllib.request.urlopen(req, timeout=90) as resp, open(target, "wb") as f:
+    with urllib.request.urlopen(req, timeout=90, context=SSL_CONTEXT) as resp, open(target, "wb") as f:
         shutil.copyfileobj(resp, f)
+
+def zotero_collection_key_by_name(name: str) -> str:
+    collection_name = (name or "").strip()
+    if not (ZOTERO_API_KEY and ZOTERO_USER_ID and collection_name):
+        return ""
+
+    req = urllib.request.Request(
+        f"https://api.zotero.org/users/{ZOTERO_USER_ID}/collections?limit=100",
+        headers={
+            "Zotero-API-Key": ZOTERO_API_KEY,
+            "Zotero-API-Version": "3",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30, context=SSL_CONTEXT) as resp:
+        rows = json.loads(resp.read().decode("utf-8"))
+
+    for row in rows:
+        data = row.get("data", {}) if isinstance(row, dict) else {}
+        if str(data.get("name") or "").strip() == collection_name:
+            return str(data.get("key") or "").strip()
+    return ""
+
+def _zotero_api_headers(extra: dict | None = None) -> dict:
+    headers = {
+        "Zotero-API-Key": ZOTERO_API_KEY,
+        "Zotero-API-Version": "3",
+    }
+    if extra:
+        headers.update(extra)
+    return headers
+
+def _zotero_post_json(path: str, payload, timeout: int = 30):
+    req = urllib.request.Request(
+        f"https://api.zotero.org/users/{ZOTERO_USER_ID}{path}",
+        data=json.dumps(payload).encode("utf-8"),
+        headers=_zotero_api_headers({"Content-Type": "application/json"}),
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=SSL_CONTEXT) as resp:
+            body = resp.read().decode("utf-8", errors="ignore")
+            return json.loads(body) if body.strip() else {}
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(detail or f"Zotero HTTP {e.code}") from e
+
+def _zotero_delete_item(item_key: str, timeout: int = 20):
+    if not item_key:
+        return
+    req = urllib.request.Request(
+        f"https://api.zotero.org/users/{ZOTERO_USER_ID}/items/{item_key}",
+        headers=_zotero_api_headers(),
+        method="DELETE",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=SSL_CONTEXT) as resp:
+            _ = resp.read()
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(detail or f"Zotero delete HTTP {e.code}") from e
+
+def _zotero_created_key(write_result: dict) -> str:
+    successful = write_result.get("successful", {}) if isinstance(write_result, dict) else {}
+    row = successful.get("0")
+    if isinstance(row, str):
+        return row
+    if isinstance(row, dict):
+        data = row.get("data", {}) if isinstance(row.get("data"), dict) else {}
+        return str(row.get("key") or data.get("key") or "").strip()
+    return ""
+
+def _download_pdf_bytes(pdf_url: str) -> bytes:
+    req = urllib.request.Request(pdf_url, headers={"User-Agent": "DailyPaper/1.0"})
+    with urllib.request.urlopen(req, timeout=90, context=SSL_CONTEXT) as resp:
+        return resp.read()
+
+def _zotero_upload_attachment_bytes(attachment_key: str, filename: str, pdf_bytes: bytes, logs: list[str] | None = None):
+    logs = logs if logs is not None else []
+    if not attachment_key:
+        raise RuntimeError("Missing Zotero attachment key")
+    if not pdf_bytes:
+        raise RuntimeError("Empty PDF bytes")
+
+    md5_hex = hashlib.md5(pdf_bytes).hexdigest()
+    verify_path = certifi.where() if certifi else True
+    logs.append(f"upload_auth:start attachment={attachment_key} bytes={len(pdf_bytes)}")
+    try:
+        r = requests.post(
+            f"https://api.zotero.org/users/{ZOTERO_USER_ID}/items/{attachment_key}/file",
+            headers=_zotero_api_headers({"If-None-Match": "*"}),
+            data={
+                "md5": md5_hex,
+                "filename": filename,
+                "filesize": str(len(pdf_bytes)),
+                "mtime": str(int(time.time() * 1000)),
+            },
+            timeout=30,
+            verify=verify_path,
+        )
+        r.raise_for_status()
+        auth = r.json() if r.text.strip() else {}
+        logs.append(f"upload_auth:ok exists={bool(auth.get('exists'))}")
+    except requests.RequestException as e:
+        detail = ""
+        if getattr(e, "response", None) is not None:
+            detail = e.response.text
+        raise RuntimeError(detail or f"Zotero upload auth failed: {e}") from e
+
+    if auth.get("exists"):
+        logs.append("upload_auth:exists (already uploaded)")
+        return
+
+    upload_url = str(auth.get("url") or "").strip()
+    upload_key = str(auth.get("uploadKey") or "").strip()
+    if not upload_url or not upload_key:
+        raise RuntimeError(f"Invalid Zotero upload auth response: {auth}")
+
+    prefix = auth.get("prefix", "")
+    suffix = auth.get("suffix", "")
+    content_type = str(auth.get("contentType") or "application/octet-stream")
+    upload_body = (
+        (prefix.encode("utf-8") if isinstance(prefix, str) else bytes(prefix))
+        + pdf_bytes
+        + (suffix.encode("utf-8") if isinstance(suffix, str) else bytes(suffix))
+    )
+    logs.append("upload_binary:start")
+    try:
+        r = requests.post(
+            upload_url,
+            headers={"Content-Type": content_type},
+            data=upload_body,
+            timeout=120,
+            verify=verify_path,
+        )
+        r.raise_for_status()
+        logs.append(f"upload_binary:ok status={r.status_code}")
+    except requests.RequestException as e:
+        detail = ""
+        if getattr(e, "response", None) is not None:
+            detail = e.response.text
+        raise RuntimeError(detail or f"Zotero file upload failed: {e}") from e
+
+    logs.append("upload_register:start")
+    try:
+        r = requests.post(
+            f"https://api.zotero.org/users/{ZOTERO_USER_ID}/items/{attachment_key}/file",
+            headers=_zotero_api_headers({"If-None-Match": "*"}),
+            data={"upload": upload_key},
+            timeout=30,
+            verify=verify_path,
+        )
+        r.raise_for_status()
+        logs.append(f"upload_register:ok status={r.status_code}")
+    except requests.RequestException as e:
+        detail = ""
+        if getattr(e, "response", None) is not None:
+            detail = e.response.text
+        raise RuntimeError(detail or f"Zotero file register failed: {e}") from e
+
+def add_to_zotero(card: dict, fallback_date: str):
+    if not (ZOTERO_API_KEY and ZOTERO_USER_ID):
+        raise RuntimeError("Zotero env is not configured")
+
+    logs: list[str] = []
+    parent_key = ""
+    attachment_key = ""
+    pid = str(card.get("pid") or "").strip()
+    title = str(card.get("title") or "").strip() or (pid or "Untitled")
+    raw_url = str(card.get("url") or "").strip()
+    pdf_url = to_pdf_url(pid, raw_url)
+    abs_url = raw_url.strip()
+    if not abs_url and pid:
+        abs_url = f"https://arxiv.org/abs/{pid}"
+    if abs_url and not abs_url.startswith(("http://", "https://")):
+        abs_url = "https://" + abs_url
+    doi = f"10.48550/arXiv.{pid}" if pid else ""
+    analyzed = card.get("card") if isinstance(card.get("card"), dict) else {}
+    one_liner = str(analyzed.get("one_liner") or "").strip()
+    raw_summary = str(card.get("raw_summary") or "").strip()
+    abstract_note = "\n\n".join(s for s in [one_liner, raw_summary] if s)[:20000]
+    tags = [{"tag": str(lb)} for lb in (card.get("labels") or []) if str(lb).strip()]
+
+    item = {
+        "itemType": "preprint",
+        "title": title,
+        "abstractNote": abstract_note,
+        "repository": "arXiv" if pid else "",
+        "archiveID": f"arXiv:{pid}" if pid else "",
+        "date": str(card.get("published_at") or card.get("date") or fallback_date or ""),
+        "DOI": doi,
+        "url": abs_url,
+        "accessDate": "CURRENT_TIMESTAMP",
+        "libraryCatalog": "arXiv.org" if pid else "",
+        "language": "en",
+        "extra": f"arXiv: {pid}" if pid else "",
+        "tags": tags,
+    }
+
+    if ZOTERO_COLLECTION:
+        logs.append(f"collection_lookup:start name={ZOTERO_COLLECTION}")
+        collection_key = zotero_collection_key_by_name(ZOTERO_COLLECTION)
+        if collection_key:
+            item["collections"] = [collection_key]
+            logs.append(f"collection_lookup:ok key={collection_key}")
+        else:
+            logs.append("collection_lookup:miss (continue without collection)")
+
+    try:
+        logs.append("parent_create:start")
+        parent_res = _zotero_post_json("/items", [item], timeout=30)
+        parent_key = _zotero_created_key(parent_res)
+        if not parent_key:
+            raise RuntimeError(f"Failed to create Zotero item: {parent_res}")
+        logs.append(f"parent_create:ok key={parent_key}")
+
+        if not pdf_url:
+            logs.append("pdf_url:missing (metadata-only item)")
+            return {"parent": parent_res, "attachment": None, "logs": logs}
+
+        logs.append(f"pdf_download:start url={pdf_url}")
+        pdf_bytes = _download_pdf_bytes(pdf_url)
+        logs.append(f"pdf_download:ok bytes={len(pdf_bytes)}")
+        filename = sanitize_filename(title or pid, fallback=(pid or "paper")) + ".pdf"
+        attachment = {
+            "itemType": "attachment",
+            "linkMode": "imported_file",
+            "title": "PDF",
+            "parentItem": parent_key,
+            "accessDate": "CURRENT_TIMESTAMP",
+            "contentType": "application/pdf",
+            "filename": filename,
+        }
+        logs.append("attachment_create:start")
+        attach_res = _zotero_post_json("/items", [attachment], timeout=30)
+        attachment_key = _zotero_created_key(attach_res)
+        if not attachment_key:
+            raise RuntimeError(f"Failed to create Zotero attachment item: {attach_res}")
+        logs.append(f"attachment_create:ok key={attachment_key}")
+
+        _zotero_upload_attachment_bytes(attachment_key, filename, pdf_bytes, logs=logs)
+        logs.append("zotero_sync:done")
+        return {"parent": parent_res, "attachment": attach_res, "logs": logs}
+    except Exception as e:
+        rollback_errors = []
+        if attachment_key:
+            try:
+                _zotero_delete_item(attachment_key)
+                logs.append(f"rollback:deleted attachment={attachment_key}")
+            except Exception as de:
+                rollback_errors.append(f"attachment={attachment_key}: {de}")
+        if parent_key:
+            try:
+                _zotero_delete_item(parent_key)
+                logs.append(f"rollback:deleted parent={parent_key}")
+            except Exception as de:
+                rollback_errors.append(f"parent={parent_key}: {de}")
+        if rollback_errors:
+            logs.append("rollback:failed " + " | ".join(rollback_errors))
+        raise ZoteroSyncError(str(e), logs=logs) from e
 
 def explode_cards(df: pd.DataFrame):
     cards = []
@@ -490,7 +768,10 @@ def render_card(c, render_key: str):
         unsafe_allow_html=True,
     )
 
-    _, heart_col = st.columns([0.95, 0.05], vertical_alignment="center")
+    _, heart_col, zotero_col = st.columns([0.90, 0.05, 0.05], vertical_alignment="center")
+    zotero_clicked = False
+    zotero_log_key = f"zlog_{render_key}_{pid}"
+    zotero_status_key = f"zstatus_{render_key}_{pid}"
     with heart_col:
         is_saved = favorite_pdf_path(c, date).exists()
         heart_icon = "❤️" if is_saved else "♡"
@@ -501,14 +782,42 @@ def render_card(c, render_key: str):
             width="content",
             help="Save PDF",
         )
+    with zotero_col:
+        zotero_clicked = st.button(
+            "Z",
+            key=f"zot_{render_key}_{pid}",
+            type="tertiary",
+            width="content",
+            help="Add to Zotero",
+        )
     if clicked:
         try:
             save_favorite_pdf(c, date)
         except Exception:
             pass
         st.rerun(scope="fragment")
+    if zotero_clicked:
+        try:
+            result = add_to_zotero(c, date)
+            st.session_state[zotero_log_key] = result.get("logs", [])
+            st.session_state[zotero_status_key] = "success"
+            st.toast("Added to Zotero")
+            st.rerun(scope="fragment")
+        except Exception as e:
+            st.session_state[zotero_log_key] = getattr(e, "logs", [])
+            st.session_state[zotero_status_key] = "error"
+            st.toast(f"Zotero failed: {e}", icon="⚠️")
+            st.error(f"Zotero upload failed: {e}")
+            if getattr(e, "logs", None):
+                st.code("\n".join(e.logs), language="text")
 
     # details (Streamlit expander가 UI 더 좋음)
+    last_logs = st.session_state.get(zotero_log_key, [])
+    if last_logs:
+        last_status = st.session_state.get(zotero_status_key, "")
+        with st.expander("Zotero log", expanded=(last_status == "error")):
+            st.code("\n".join(last_logs), language="text")
+
     with st.expander("자세히", expanded=False):
         if not card:
             st.info("아직 분석 카드가 없어. `run-yesterday`를 다시 돌리면 채워질 거야.")
