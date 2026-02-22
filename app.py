@@ -50,6 +50,7 @@ h1,h2,h3 { letter-spacing: -0.02em; }
 }
 .cardTop { display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:8px; }
 .pid { color: var(--muted); font-size: 0.85rem; }
+.metaSep { color: rgba(255,255,255,0.25); margin: 0 6px; font-weight: 300; }
 .badge {
   display:inline-flex; align-items:center; gap:6px;
   border: 1px solid rgba(122,162,255,.25);
@@ -179,7 +180,19 @@ def connect():
     if not DB_PATH.exists():
         st.error(f"DB not found: {DB_PATH}\n먼저 run-yesterday를 돌려서 data/db/dailypaper.sqlite3를 만들어줘.")
         st.stop()
-    return sqlite3.connect(str(DB_PATH))
+    con = sqlite3.connect(str(DB_PATH))
+    # migration: submitted_by, organization
+    cur = con.cursor()
+    cur.execute("PRAGMA table_info(papers)")
+    cols = {r[1] for r in cur.fetchall()}
+    if "submitted_by" not in cols:
+        cur.execute("ALTER TABLE papers ADD COLUMN submitted_by TEXT DEFAULT ''")
+    if "organization" not in cols:
+        cur.execute("ALTER TABLE papers ADD COLUMN organization TEXT DEFAULT ''")
+    if "published_at" not in cols:
+        cur.execute("ALTER TABLE papers ADD COLUMN published_at TEXT DEFAULT ''")
+    con.commit()
+    return con
 @st.cache_data(ttl=60*60*24)
 def translate_keywords_to_en(kws: list[str]) -> list[str]:
     # 한글이 없으면 그대로 반환
@@ -241,6 +254,9 @@ def load_rows(date: str):
     q = """
     SELECT
       p.date, p.pid, p.title, p.summary, p.url,
+      COALESCE(p.submitted_by,'') as submitted_by,
+      COALESCE(p.organization,'') as organization,
+      COALESCE(p.published_at,'') as published_at,
       COALESCE(a.labels_json,'[]') as labels_json,
       COALESCE(a.card_json,'{}')   as card_json
     FROM papers p
@@ -324,6 +340,9 @@ def explode_cards(df: pd.DataFrame):
                 "pid": r["pid"],
                 "title": r["title"] or "",
                 "url": r["url"] or "",
+                "submitted_by": r.get("submitted_by") or "",
+                "organization": r.get("organization") or "",
+                "published_at": r.get("published_at") or "",
                 "labels": labels,
                 "card": card if isinstance(card, dict) else {},
                 "raw_summary": r["summary"] or "",
@@ -428,6 +447,15 @@ def render_card(c, render_key: str):
     kws = translate_keywords_to_en(kws) if kws else kws
 
     labels_txt = " · ".join(labels)
+    published_at = (c.get("published_at") or "").strip()
+    organization = (c.get("organization") or "").strip()
+    segs = [labels_txt]
+    if published_at:
+        segs.append(published_at)
+    if organization:
+        segs.append(organization)
+    top_line = f'<span class="metaSep"> | </span>'.join(html.escape(s) for s in segs)
+
     # 원문: DB에 있는 url로 클릭 시 원본 링크 열기 (URL 정규화 + href 이스케이프)
     if url:
         safe_url = html.escape(url, quote=True)
@@ -439,7 +467,7 @@ def render_card(c, render_key: str):
         f"""
 <div class="card">
   <div class="cardTop">
-    <div class="pid">{pid} · {labels_txt}</div>
+    <div class="pid">{top_line}</div>
     {top_right}
   </div>
   <div class="title">{title}</div>
