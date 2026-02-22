@@ -356,26 +356,53 @@ def save_favorite_pdf(card: dict, fallback_date: str):
     with urllib.request.urlopen(req, timeout=90, context=SSL_CONTEXT) as resp, open(target, "wb") as f:
         shutil.copyfileobj(resp, f)
 
-def zotero_collection_key_by_name(name: str) -> str:
-    collection_name = (name or "").strip()
-    if not (ZOTERO_API_KEY and ZOTERO_USER_ID and collection_name):
-        return ""
+ZOTERO_FAVORITE_COLLECTION = "DailyPaperFavorite"
 
+def _zotero_fetch_collections(parent_key: str | None = None) -> list:
+    """Fetch collections (top-level if parent_key is None, else subcollections)."""
+    if not (ZOTERO_API_KEY and ZOTERO_USER_ID):
+        return []
+    if parent_key:
+        path = f"/collections/{parent_key}/collections?limit=100"
+    else:
+        path = "/collections?limit=100"
     req = urllib.request.Request(
-        f"https://api.zotero.org/users/{ZOTERO_USER_ID}/collections?limit=100",
+        f"https://api.zotero.org/users/{ZOTERO_USER_ID}{path}",
         headers={
             "Zotero-API-Key": ZOTERO_API_KEY,
             "Zotero-API-Version": "3",
         },
     )
     with urllib.request.urlopen(req, timeout=30, context=SSL_CONTEXT) as resp:
-        rows = json.loads(resp.read().decode("utf-8"))
+        return json.loads(resp.read().decode("utf-8"))
 
+def zotero_collection_key_by_name(name: str, parent_key: str | None = None) -> str:
+    collection_name = (name or "").strip()
+    if not collection_name:
+        return ""
+    rows = _zotero_fetch_collections(parent_key)
     for row in rows:
         data = row.get("data", {}) if isinstance(row, dict) else {}
         if str(data.get("name") or "").strip() == collection_name:
             return str(data.get("key") or "").strip()
     return ""
+
+def zotero_get_or_create_collection(name: str, parent_key: str | None, logs: list[str]) -> str:
+    """Get existing collection key or create it. parent_key=None means top-level."""
+    name = (name or "").strip()
+    if not name:
+        return ""
+    key = zotero_collection_key_by_name(name, parent_key)
+    if key:
+        logs.append(f"collection:found name={name} key={key}")
+        return key
+    payload = {"name": name, "parentCollection": parent_key if parent_key else False}
+    logs.append(f"collection:create name={name} parent={parent_key or 'root'}")
+    res = _zotero_post_json("/collections", [payload], timeout=30)
+    key = _zotero_created_key(res)
+    if key:
+        logs.append(f"collection:created key={key}")
+    return key
 
 def _zotero_api_headers(extra: dict | None = None) -> dict:
     headers = {
@@ -553,14 +580,16 @@ def add_to_zotero(card: dict, fallback_date: str):
         "tags": tags,
     }
 
-    if ZOTERO_COLLECTION:
-        logs.append(f"collection_lookup:start name={ZOTERO_COLLECTION}")
-        collection_key = zotero_collection_key_by_name(ZOTERO_COLLECTION)
-        if collection_key:
-            item["collections"] = [collection_key]
-            logs.append(f"collection_lookup:ok key={collection_key}")
-        else:
-            logs.append("collection_lookup:miss (continue without collection)")
+    # 내 라이브러리/DailyPaperFavorite/날짜 구조로 저장
+    paper_date = str(card.get("date") or fallback_date or "").strip()
+    if paper_date:
+        logs.append("collection:DailyPaperFavorite/date structure")
+        parent_coll = zotero_get_or_create_collection(ZOTERO_FAVORITE_COLLECTION, None, logs)
+        if parent_coll:
+            date_coll = zotero_get_or_create_collection(paper_date, parent_coll, logs)
+            if date_coll:
+                item["collections"] = [date_coll]
+                logs.append(f"collection:assigned date_key={date_coll}")
 
     try:
         logs.append("parent_create:start")
